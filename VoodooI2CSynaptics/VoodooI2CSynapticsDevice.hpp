@@ -73,7 +73,7 @@ private:
     IOCommandGate* command_gate;
     UInt16 hid_descriptor_register;
     IOInterruptEventSource* interrupt_source;
-    IOTimerEventSource* interrupt_simulator; /* Sasha - Implement polling mode */
+    IOTimerEventSource* interrupt_simulator;
     
     OSArray* transducers;
     
@@ -113,7 +113,6 @@ protected:
     bool awake;
     const char* name;
     IOWorkLoop* work_loop;
-    bool reading;
     
 public:
     void stop(IOService* device) override;
@@ -158,7 +157,7 @@ public:
     
     void releaseResources();
     
-    void simulateInterrupt(OSObject* owner, IOTimerEventSource* timer); /* Sasha - Implement polling mode */
+    void simulateInterrupt(OSObject* owner, IOTimerEventSource* timer);
 };
 
 

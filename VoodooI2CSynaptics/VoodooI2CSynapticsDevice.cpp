@@ -160,7 +160,12 @@ VoodooI2CSynapticsDevice* VoodooI2CSynapticsDevice::probe(IOService* provider, S
 
 void VoodooI2CSynapticsDevice::releaseResources() {
     unpublish_multitouch_interface();
-    
+
+    if (command_gate) {
+        work_loop->removeEventSource(command_gate);
+        OSSafeReleaseNULL(command_gate);
+    }
+
     if (interrupt_source) {
         interrupt_source->disable();
         work_loop->removeEventSource(interrupt_source);
@@ -191,18 +196,21 @@ void VoodooI2CSynapticsDevice::releaseResources() {
 bool VoodooI2CSynapticsDevice::start(IOService* api) {
     if (!super::start(api))
         return false;
-    
-    reading = true;
-    
+
     work_loop = getWorkLoop();
-    
     if (!work_loop) {
         IOLog("%s::%s Could not get work loop\n", getName(), name);
         goto exit;
     }
     
     work_loop->retain();
-    
+
+    command_gate = IOCommandGate::commandGate(this);
+    if (!command_gate || (work_loop->addEventSource(command_gate) != kIOReturnSuccess)) {
+        IOLog("%s::%s Could not open command gate\n", getName(), name);
+        goto exit;
+    }
+
     acpi_device->retain();
     
     if (!api->open(this)) {
@@ -235,9 +243,6 @@ bool VoodooI2CSynapticsDevice::start(IOService* api) {
     
     publish_multitouch_interface();
     
-    reading = false;
-    
-    
     return true;
 exit:
     releaseResources();
@@ -256,7 +261,13 @@ bool VoodooI2CSynapticsDevice::init(OSDictionary* properties) {
 
     transducers = NULL;
     awake = true;
-    
+
+    work_loop = nullptr;
+    command_gate = nullptr;
+
+    interrupt_source = nullptr;
+    interrupt_simulator = nullptr;
+
     return true;
 }
 
@@ -955,14 +966,25 @@ int VoodooI2CSynapticsDevice::rmi_populate() {
 IOReturn VoodooI2CSynapticsDevice::setPowerState(unsigned long powerState, IOService *whatDevice){
     if (powerState == 0){
         //Going to sleep
-        
-        awake = false;
+        if (interrupt_simulator) {
+            interrupt_simulator->disable();
+        } else if (interrupt_source) {
+            interrupt_source->disable();
+        }
         
         IOLog("%s::Going to Sleep!\n", getName());
+        awake = false;
     } else {
         if (!awake){
-            
             awake = true;
+
+            if (interrupt_simulator) {
+                interrupt_simulator->setTimeoutMS(200);
+                interrupt_simulator->enable();
+            } else if (interrupt_source) {
+                interrupt_source->enable();
+            }
+
             IOLog("%s::Woke up from Sleep!\n", getName());
         } else {
             IOLog("%s::Trackpad already awake! Not reinitializing.\n", getName());
@@ -973,22 +995,13 @@ IOReturn VoodooI2CSynapticsDevice::setPowerState(unsigned long powerState, IOSer
 
 
 void VoodooI2CSynapticsDevice::interruptOccured(OSObject* owner, IOInterruptEventSource* src, int intCount){
-    if (reading || !awake)
+    if (!awake)
         return;
-    
-    thread_t new_thread;
-    kern_return_t ret = kernel_thread_start(OSMemberFunctionCast(thread_continue_t, this, &VoodooI2CSynapticsDevice::get_input), this, &new_thread);
-    if (ret != KERN_SUCCESS) {
-        reading = false;
-        IOLog("%s Thread error while attemping to get input report\n", getName());
-    } else {
-        thread_deallocate(new_thread);
-    }
+
+    command_gate->attemptAction(OSMemberFunctionCast(IOCommandGate::Action, this, &VoodooI2CSynapticsDevice::get_input));
 }
 
 void VoodooI2CSynapticsDevice::get_input() {
-    reading = true;
-    
     uint8_t reg = 0;
     api->writeI2C(&reg, 1);
     
@@ -1001,16 +1014,14 @@ void VoodooI2CSynapticsDevice::get_input() {
     }
     
     if (rmiInput[0] == 0x00){
-        goto exit;
+        return;
     }
     
     if (rmiInput[0] != RMI_ATTN_REPORT_ID) {
-        goto exit;
+        return;
     }
     
     TrackpadRawInput(rmiInput);
-exit:
-    reading = false;
 }
 
 bool VoodooI2CSynapticsDevice::publish_multitouch_interface() {
